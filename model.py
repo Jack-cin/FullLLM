@@ -505,12 +505,18 @@ class Transformer(nn.Module):
         out_tokens = []
         for i, toks in enumerate(tokens.tolist()):
             start = len(prompt_tokens[i])
-            # 如果到达eos token，则截断生成的tokens
-            if eos_id in toks:
-                eos_idx = toks.index(eos_id)
+            # 🛠️ 原实现在「整条序列」里找 eos，而 prompt 本身通常以 bos 开头（很多分词器里
+            #    bos==eos，或者调用方传的就是同一 id）→ toks.index(eos_id) 命中 prompt 的第一个
+            #    token，于是 toks[:1]，生成的文本被整段吞掉（sample.py 打印出来是空白的根因）。
+            #    正确做法：只在「新生成的那一段」里找 eos。
+            if eos_id is not None and eos_id in toks[start:]:
+                eos_idx = start + toks[start:].index(eos_id)
                 toks = toks[:eos_idx + 1]
-            if echo:
-                toks = prompt_tokens[i] + toks  # 如果echo为True，则将prompt_tokens加入生成结果
+            # 🛠️ 修正 echo 语义：tokens 本来就包含 prompt，
+            #    原实现 echo=True 时又拼了一次 prompt（prompt 被打印两遍）。
+            #    现在 echo=True 返回「prompt + 生成」的完整序列，echo=False 只返回新生成的部分。
+            if not echo:
+                toks = toks[start:]  # 只返回新生成的部分
             out_tokens.append(toks)
         return out_tokens
 

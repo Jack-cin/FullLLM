@@ -106,7 +106,9 @@ from contextlib import nullcontext  # “什么也不做”的 with 占位符
 from datetime import datetime       # 获取当前日期时间
 from functools import partial       # 提前锁定部分参数，得到“半成品函数”
 from dataclasses import dataclass, asdict, is_dataclass
+from typing import List           # 🛠️ 类型标注：奖励函数接收 token 列表
 
+import numpy as np           # 🛠️ 新增：PPO 日志里统计奖励均值/标准差
 import torch                 # PyTorch 主库，负责张量+自动求导
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -120,6 +122,8 @@ from model import (          # 本项目自带的模型文件
 from tinystories import Task, get_tokenizer_model_path  # TinyStories 数据迭代器与词表文件定位
 from tokenizer import Tokenizer                         # 把 SentencePiece 打包成简单接口
 from export import model_export                         # 训练完把权重导出成 model.bin
+# 🛠️ 新增：PPO 训练器与奖励函数（原来 train.py 只 import 了模型类，ppo.py 从未被调用）
+from ppo import PPOTrainer, PPOConfig, LengthReward, LengthSampler
 import argparse
 # -----------------------------------------------------------------------------
 # 👉 1. 可调“旋钮”汇总（保持原注释，仅分组整理）
@@ -145,6 +149,12 @@ def TrainConfig():
     log_group.add_argument("--init_from", type=str, choices=["scratch", "resume"], default="scratch", help="初始化:从头训/接续") #resume
     # 🛠️ 新增：显式指定续训 checkpoint（跨目录续训、加载别人给的 ckpt 时很有用）
     log_group.add_argument("--ckpt_path", type=str, default="", help="续训 checkpoint 路径（留空则自动在 out_dir 中查找）")
+    # 🛠️ 新增：把 --max_iters 解释为「本轮再训多少步」而不是「总步数」。
+    #    resume 时 ckpt 里的 iter_num 往往已经很大（如 98000），若 max_iters 仍按“总步数”
+    #    解释，会出现两种静默故障：① 一步都不跑就退出；② get_lr() 落到 min_lr=0，
+    #    学习率变成 0、模型根本不更新（README 的 PPO 示例参数正好会踩到）。
+    log_group.add_argument("--iters_from_now", action="store_true", default=False,
+                          help="--max_iters 表示“从当前步开始再训多少步”（默认表示总步数）")
 
     # ---------------------------
     # 参数分组：数据配置
@@ -187,8 +197,12 @@ def TrainConfig():
     # 参数分组：学习率调度（修正布尔逻辑）
     # ---------------------------
     lr_group = parser.add_argument_group("学习率调度")
-    lr_group.add_argument("--decay_lr", action="store_false",default=True,  # ✅ store_false对应默认True
-                    help="禁用学习率衰减（默认启用）")  
+    # 🛠️ 默认值改成 None，用来区分「用户显式关闭衰减」和「没传」：
+    #    * 预训练：不传 → 启用余弦衰减（与原默认一致）
+    #    * PPO  ：不传 → 不衰减（RL 微调通常用固定小学习率；否则 resume 时
+    #             余弦调度会算出接近 min_lr 甚至 0 的学习率，--ppo_lr 形同虚设）
+    lr_group.add_argument("--decay_lr", action="store_false", default=None,
+                    help="禁用学习率衰减（预训练默认启用，PPO 默认禁用）")  
     '''学习率预热"在训练的最开始阶段，逐步增加学习率到一个预设的最大值，而不是一开始就使用较大的学习率。
     这样做的主要目的是稳定训练过程，避免模型参数在初始阶段因为过大的学习率而发生剧烈波动，导致模型不收敛或收敛缓慢。'''
     lr_group.add_argument("--warmup_iters", type=int, default=1000, help="学习率预热步数")
@@ -220,7 +234,49 @@ def TrainConfig():
     ppo_group.add_argument("--target_len", type=int, default=200, help="目标序列长度")
     ppo_group.add_argument("--max_gen_len", type=int, default=300, help="最大生成长度")
 
-    return parser.parse_args()
+    # 🛠️ 新增：把 ppo.py 的 PPOTrainer 真正接进训练循环所需的参数
+    ppo_group.add_argument("--ppo_rollout_size", type=int, default=64,
+                          help="每个 PPO step 采样的 (prompt, response) 对数（不能超过 --batch_size）")
+    ppo_group.add_argument("--ppo_epochs", type=int, default=4, help="同一批 rollout 复用几个 epoch")
+    ppo_group.add_argument("--ppo_mini_batch_size", type=int, default=0,
+                          help="PPO 的 mini-batch 大小（0 = 自动 = rollout_size/8）")
+    ppo_group.add_argument("--ppo_grad_accum_steps", type=int, default=1, help="PPO 梯度累积步数")
+    ppo_group.add_argument("--ppo_lr", type=float, default=0.0,
+                          help="PPO 阶段学习率（0 = 沿用 --learning_rate）")
+    ppo_group.add_argument("--ppo_temperature", type=float, default=0.9, help="rollout 采样温度")
+    ppo_group.add_argument("--ppo_top_k", type=int, default=0, help="rollout top-k（0=关闭）")
+    ppo_group.add_argument("--ppo_top_p", type=float, default=0.95, help="rollout top-p（<=0=关闭）")
+    ppo_group.add_argument("--ppo_cliprange", type=float, default=0.2, help="策略比率裁剪范围 ε")
+    ppo_group.add_argument("--ppo_cliprange_value", type=float, default=0.2, help="value 裁剪范围")
+    ppo_group.add_argument("--ppo_vf_coef", type=float, default=0.1, help="value loss 权重")
+    ppo_group.add_argument("--ppo_kl_penalty", type=str, default="kl",
+                          choices=["kl", "abs", "mse", "full"], help="KL 惩罚形式")
+    ppo_group.add_argument("--ppo_gamma", type=float, default=1.0, help="GAE 折扣因子 γ")
+    ppo_group.add_argument("--ppo_lam", type=float, default=0.95, help="GAE 平滑因子 λ")
+    ppo_group.add_argument("--ppo_early_stopping", action="store_true", default=False,
+                          help="KL 超过 1.5×target_kl 时提前结束该 batch 的 epoch")
+    ppo_group.add_argument("--ppo_whiten_rewards", action="store_true", default=False,
+                          help="对奖励做白化（零均值单位方差）")
+    ppo_group.add_argument("--ppo_reward", type=str, default="length",
+                          help="奖励函数，可逗号组合：length（长度对齐）/ completion（结尾标点）/ "
+                               "repetition（n-gram 不重复率）；也支持 both(=length+completion)、all（三者相加）")
+    ppo_group.add_argument("--ppo_reward_target_len", type=int, default=0,
+                          help="长度奖励的目标长度（0 = 用 --target_len）")
+    ppo_group.add_argument("--ppo_gen_len", type=int, default=0,
+                          help="rollout 生成长度（0 = 自动 = min(max_gen_len, max_seq_len-start_len-1)）")
+    # 🛠️ PPO 质量监控的评估批量：训练用的 batch_size 默认 128、max_seq_len 默认 256，
+    #    一次评估前向在 2 核 CPU 上要 ~3 秒；监控只需要看趋势，16×256 就够（快一个量级）。
+    ppo_group.add_argument("--ppo_eval_batch_size", type=int, default=16,
+                          help="PPO 质量监控（CE 损失）用的小批量")
+    ppo_group.add_argument("--ppo_prompt_file", type=str, default="",
+                          help="prompt 文本文件（每行一条故事开头）；留空则从训练集取真实故事开头。"
+                               "每行会被编码并截断到 --start_len 个 token")
+
+    arg = parser.parse_args()
+    # 🛠️ 归一化 --decay_lr：None 表示“未指定”，按阶段取默认值（预训练 True / PPO False）
+    if arg.decay_lr is None:
+        arg.decay_lr = not arg.ppo
+    return arg
 
 
 # -----------------------------------------------------------------------------
@@ -228,7 +284,7 @@ def TrainConfig():
 # -----------------------------------------------------------------------------
 import math
 
-def get_lr(it: int, arg: TrainConfig) -> float:
+def get_lr(it: int, arg: TrainConfig, max_iters: int = None) -> float:
     """线性 warmup + 余弦衰减调度器
     
     参数说明：
@@ -244,20 +300,23 @@ def get_lr(it: int, arg: TrainConfig) -> float:
     # 当迭代步数小于预热步数时，执行线性增长策略
     # 公式：lr = base_lr * (当前步数 / 总预热步数)
     # 作用：避免训练初期参数剧烈波动，类似「缓步加速」
+    # 🛠️ 支持显式传入衰减终点：resume / PPO 阶段需要用它，否则 it > max_iters 时
+    #    会直接返回 min_lr（默认 0）→ 学习率静默变 0，训练“看似在跑但没有更新”。
+    max_iters = arg.max_iters if max_iters is None else max_iters
     if it < arg.warmup_iters:
         return arg.learning_rate * it / arg.warmup_iters
     
     # ================ 训练终止：保护机制 ================
     # 当超过最大迭代步数时保持最小学习率
     # 作用：防止后续计算产生意外波动
-    if it > arg.max_iters:
+    if it > max_iters:
         return arg.min_lr
     
     # ============== 训练中：余弦衰减阶段（核心计算） ==============
     # 计算衰减进度：[0,1]区间，0表示刚结束预热，1表示训练结束
     # 示例：当 warmup=1000, max=10000, it=2000 时：
     # decay_ratio = (2000-1000)/(10000-1000) ≈ 0.111
-    decay_ratio = (it - arg.warmup_iters) / (arg.max_iters - arg.warmup_iters)
+    decay_ratio = (it - arg.warmup_iters) / max(1, max_iters - arg.warmup_iters)
     
     # 生成余弦系数：通过余弦函数实现平滑过渡
     # 曲线特性：从1（起始点）逐渐下降至0（结束点）
@@ -358,6 +417,26 @@ def resolve_ckpt_path(out_dir: str, ppo: bool, ckpt_path: str = "") -> str:
     return os.path.join(out_dir, candidates[0])
 
 
+def model_args_to_dict(model) -> dict:
+    """取模型真实的结构超参（ModelArgs 字段），用于写进 checkpoint。"""
+    params = getattr(model, "params", None)
+    if params is None:                      # DDP / compile 包装时剥一层
+        params = getattr(getattr(model, "module", None), "params", None)
+    if params is None:
+        return {}
+    return {k: v for k, v in dict(vars(params)).items() if not k.startswith("_")}
+
+
+def checkpoint_args(arg, model) -> dict:
+    """
+    组装写进 checkpoint 的 model_args：
+    训练配置（arg）+ 模型真实结构，后者优先级更高，保证权重形状可被正确重建。
+    """
+    merged = config_to_dict(arg)
+    merged.update(model_args_to_dict(model))
+    return merged
+
+
 def load_model_state(model, state_dict: dict, master_process: bool = True):
     """
     加载权重，并处理 torch.compile 留下的 `_orig_mod.` 前缀。
@@ -393,11 +472,99 @@ def load_model_state(model, state_dict: dict, master_process: bool = True):
     return info
 
 
+def build_reward_fn(kind: str, target_len: int, enc, sampler=None):
+    """
+    构造「奖励函数」：`reward(tokens) -> float`。
+
+    🛠️ 原仓库的 reward 只有 ppo.py 里的 LengthReward，但没有任何地方调用它，
+       也就没有奖励信号。这里把它接上，并额外提供更适合 TinyStories 的信号：
+         * length     ：`LengthReward`（-|目标长度 - 实际长度| / 100），控制篇幅
+         * completion ：结尾是否落在句末标点（. ! ? " '），鼓励生成完整故事而不是半句话
+         * both       ：两者相加
+    `sampler` 非空时，每个样本都会重新采样一次目标长度（用 ppo.py 自带的 LengthSampler），
+    让模型学会生成不同篇幅的故事。
+
+    需要自定义奖励（例如接 reward model / 人工偏好数据）时，保持 `__call__(tokens) -> float`
+    这个签名，替换传进来的 reward_fn 即可。
+    """
+    return TinyStoriesReward(kind=kind, target_len=target_len, enc=enc, sampler=sampler)
+
+
+class TinyStoriesReward:
+    """
+    基于「长度 + 结尾完整性 + 重复度」的奖励函数（可任意组合）。
+
+    为什么要有 repetition 项：TinyStories 这种小模型最典型的质量问题就是**复读**
+    （“She was happy. She was happy. She was happy.”）。这项奖励是密集的、
+    随时可优化的，比“结尾标点”这种稀疏信号更适合小规模 PPO 实验。
+    """
+
+    #: 支持的分项与别名
+    ALIASES = {"both": ("length", "completion"), "all": ("length", "completion", "repetition")}
+
+    def __init__(self, kind: str = "length", target_len: int = 200, enc=None, sampler=None,
+                 ngram: int = 3):
+        # sampler 定义自 ppo.py 自带的工具，采样一次得到本次的目标长度
+        self.kind = kind
+        self.target_len = target_len
+        self.enc = enc
+        self.sampler = sampler
+        self.ngram = ngram
+        self.kinds = self.parse_kinds(kind)
+        self.length_reward = LengthReward(target_length=target_len)
+
+    @classmethod
+    def parse_kinds(cls, kind: str):
+        """把 'repetition,length' / 'both' / 'all' 这类写法解析成分项列表。"""
+        parts = []
+        for raw in str(kind).split(","):
+            raw = raw.strip().lower()
+            if not raw:
+                continue
+            parts.extend(cls.ALIASES.get(raw, (raw,)))
+        valid = {"length", "completion", "repetition"}
+        unknown = [p for p in parts if p not in valid]
+        assert not unknown, f"未知的奖励项 {unknown}，可选：{sorted(valid | set(cls.ALIASES))}"
+        return tuple(dict.fromkeys(parts))  # 去重且保序
+
+    def repetition_score(self, tokens: List[int]) -> float:
+        """n-gram 唯一率：1.0 = 完全没有重复，越低说明复读越严重。"""
+        n = max(1, self.ngram)
+        if len(tokens) < n:
+            return 1.0
+        grams = [tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+        return len(set(grams)) / len(grams)
+    
+    def current_target(self) -> int:
+        """当前样本的目标长度：有 sampler 就采样，否则用固定值。"""
+        return int(self.sampler()) if self.sampler is not None else self.target_len
+
+    def length_score(self, tokens: List[int]) -> float:
+        self.length_reward.target_length = self.current_target()
+        return float(self.length_reward(len(tokens)))
+
+    def completion_score(self, tokens: List[int]) -> float:
+        text = self.enc.decode(tokens).strip()
+        return 1.0 if text.endswith((".", "!", "?", '"', "'")) else 0.0
+
+    def __call__(self, tokens: List[int]) -> float:
+        score = 0.0
+        for kind in self.kinds:
+            if kind == "length":
+                score += self.length_score(tokens)
+            elif kind == "completion":
+                score += self.completion_score(tokens)
+            elif kind == "repetition":
+                score += self.repetition_score(tokens)
+        return score
+
+
 # -----------------------------------------------------------------------------
 # 👉 3. Trainer 封装
 # -----------------------------------------------------------------------------
 class TinyStoriesTrainer:
     """把原脚本逻辑封装进一个类，便于后续扩展（多机、超参搜索等）。"""
+
 
     def __init__(self, arg: TrainConfig):
         self.arg = arg             # 参数类封装
@@ -405,6 +572,12 @@ class TinyStoriesTrainer:
         self._build_dataloader()   # 训练/验证数据迭代器
         self._build_model()        # GPT 或 GPT+V-head
         self._build_optimizer()    # AdamW / GradScaler
+        if arg.ppo:                # 🛠️ 启用 PPO 时再组建 PPO 训练器（含冻结的参考模型）
+            self._build_ppo()
+        # 🛠️ 统一算出「本轮的目标步数」：默认 max_iters 是总步数；
+        #    加了 --iters_from_now 则从当前 iter_num 起算（PPO 阶段还会自动兜底，见 train_ppo）。
+        self.start_iter = getattr(self, "iter_num", 0)
+        self.target_iters = self.start_iter + arg.max_iters if arg.iters_from_now else arg.max_iters
 
     # --------------------- 分布式环境相关 ---------------------
     # --------------------- 分布式训练环境设置（类似厨房团队分工） ---------------------
@@ -586,7 +759,12 @@ class TinyStoriesTrainer:
                 if isinstance(saved, argparse.Namespace):
                     saved = vars(saved)
                 if k in saved:
-                    model_args[k] = saved[k]  # 强制对齐关键参数
+                    model_args[k] = saved[k]   # 强制对齐关键参数
+                    # 🛠️ 同时写回 arg：ckpt 里保存的 model_args 决定了下游（sample.py /
+                    #    export.py）如何重建模型。若只覆盖局部字典而不回写 arg，
+                    #    就会出现“config 写着 dim=288、权重其实是 dim=64”的 checkpoint →
+                    #    加载时 size mismatch，训练完根本没法采样/导出。
+                    arg.__dict__[k] = saved[k]
 
             gptconf = ModelArgs(**model_args)  # 重新生成施工图纸
             # 重建建筑框架（与存档结构一致）
@@ -624,12 +802,22 @@ class TinyStoriesTrainer:
                 print("⏳ 正在优化施工流程（首次编译约需1分钟）...")
             unoptimized_model = self.model  # 保留原始设计图
             self.model = torch.compile(self.model)  # 生成优化后的流水线
+        else:
+            # 🛠️ 新增：始终记录“未编译/未包装”的原始模块。
+            #    torch.compile 会给参数名加 `_orig_mod.` 前缀（上一轮“续训静默丢权重”的根因），
+            #    DDP 还会再包一层。用这个引用去存 ckpt / 导出 / 当 PPO 参考模型最干净。
+            unoptimized_model = self.model
+        self.unoptimized_model = unoptimized_model
 
         # [团队协作] 分布式数据并行（组建施工分队）
         if self.ddp:  # 需要多GPU协作
             prefix = "_orig_mod." if arg.compile else ""  # 处理编译后的命名差异
-            # 指定需要忽略的共享参数（如旋转位置编码）
-            self.model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
+            # 🛠️ 原来写的是 "freqs_cis"（llama 官方仓的名字），本模型里实际叫 freqs_cos /
+            #    freqs_sin，等于这个“忽略名单”一直是空操作：DDP 每次前向都会尝试广播这两个
+            #    恒定不变的 buffer。这里改成真实名字。
+            self.model._ddp_params_and_buffers_to_ignore = {
+                prefix + "freqs_cos", prefix + "freqs_sin",
+            }
             # 创建分布式施工团队
             self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
 
@@ -728,6 +916,119 @@ class TinyStoriesTrainer:
 
 
 
+    # --------------------- PPO 训练器 ---------------------
+    def _build_ppo(self):
+        """
+        组装 PPO 训练器：策略模型 + 冻结的参考模型 π_ref + 奖励函数。
+
+        🛠️ 本轮新增。原来 train.py 只是把模型换成 TransformerWithValueHead、
+           把 ckpt 名字换成 ppo_ckpt.pt，损失依旧是交叉熵 —— ppo.py 的 PPOTrainer
+           在整个仓库里没有任何调用点，相当于“PPO 微调”名不副实。
+        """
+        arg = self.arg
+        rollout_size = min(arg.ppo_rollout_size, arg.batch_size)
+        if rollout_size != arg.ppo_rollout_size and self.master_process:
+            print(f"⚠️ ppo_rollout_size({arg.ppo_rollout_size}) 超过 batch_size({arg.batch_size})，"
+                  f"已收敛为 {rollout_size}")
+        mini_batch_size = arg.ppo_mini_batch_size or max(1, rollout_size // 8)
+        mini_batch_size = min(mini_batch_size, rollout_size)
+
+        # 奖励所要对齐的目标长度 & rollout 生成长度
+        target_len = arg.ppo_reward_target_len or arg.target_len
+        self.gen_len = arg.ppo_gen_len or min(arg.max_gen_len, arg.max_seq_len - arg.start_len - 1)
+        assert self.gen_len > 0, (
+            f"生成长度非法：max_gen_len={arg.max_gen_len}, max_seq_len={arg.max_seq_len}, "
+            f"start_len={arg.start_len} → 请调小 --start_len 或 --max_gen_len"
+        )
+
+        self.ppo_config = PPOConfig(
+            seed=1337 + self.seed_offset,
+            steps=arg.max_iters,
+            learning_rate=arg.ppo_lr if arg.ppo_lr > 0 else arg.learning_rate,
+            adap_kl_ctrl=False,
+            init_kl_coef=arg.init_kl_coef,
+            kl_penalty=arg.ppo_kl_penalty,
+            target=arg.target_kl,
+            gamma=arg.ppo_gamma,
+            lam=arg.ppo_lam,
+            cliprange=arg.ppo_cliprange,
+            cliprange_value=arg.ppo_cliprange_value,
+            vf_coef=arg.ppo_vf_coef,
+            batch_size=rollout_size,
+            mini_batch_size=mini_batch_size,
+            gradient_accumulation_steps=arg.ppo_grad_accum_steps,
+            ppo_epochs=arg.ppo_epochs,
+            max_grad_norm=arg.grad_clip if arg.grad_clip > 0 else None,
+            early_stopping=arg.ppo_early_stopping,
+            target_kl=arg.target_kl,
+            whiten_rewards=arg.ppo_whiten_rewards,
+        )
+
+        # 参考策略 π_ref：本阶段开始时的策略副本，冻结参数、只做前向
+        ref_model = deepcopy(self.unoptimized_model)
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        ref_model.eval()
+        ref_model.to(arg.device)
+        # 🛠️ 参考模型永远不带 KV cache 前向，把它的 cache 张量丢掉，省一半显存
+        #    （Attention 里 cache_k/cache_v 是普通属性、不是 buffer，不会被 .to() 移动，
+        #     所以这里显式置空最稳妥）
+        if getattr(ref_model, "params", None) is not None and ref_model.params.cache:
+            for layer in ref_model.layers:
+                layer.attention.cache = False
+                layer.attention.cache_k = None
+                layer.attention.cache_v = None
+        self.ref_model = ref_model
+
+        self.ppo_trainer = PPOTrainer(
+            config=self.ppo_config,
+            model=self.model,
+            ref_model=ref_model,
+            tokenizer=self.enc,
+            optimizer=self.optimizer,
+            scaler=self.scaler,
+            is_ddp=self.ddp,
+        )
+        # 恢复 KL 系数（续训时不要让 KL 惩罚从头再来）
+        ckpt_path = getattr(self, "ckpt_path", "")
+        if arg.init_from == "resume" and ckpt_path and os.path.exists(ckpt_path):
+            try:
+                saved = torch.load(ckpt_path, map_location="cpu")
+                if "kl_coef" in saved:
+                    self.ppo_trainer.kl_ctl.value = float(saved["kl_coef"])
+                    if self.master_process:
+                        print(f"⤵ 恢复 KL 系数：{self.ppo_trainer.kl_ctl.value:.4f}")
+            except Exception as e:
+                if self.master_process:
+                    print(f"⚠️ KL 系数恢复失败：{e}")
+
+        # PPO 阶段的学习率（通常比预训练低一个量级）
+        lr = self.ppo_config.learning_rate
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+
+        self.reward_fn = build_reward_fn(arg.ppo_reward, target_len, self.enc, sampler=None)
+        # 目标长度采样：给了明确的 --ppo_reward_target_len 就用固定值，否则在
+        # [start_len, target_len] 内随机采样（ppo.py 自带 LengthSampler 是左闭右开区间），
+        # 并且把上界收敛到本次 rollout 真正能生成的长度，避免奖励恒为同一个极小值。
+        if arg.ppo_reward_target_len <= 0 and "length" in self.reward_fn.kinds:
+            lo = max(1, min(arg.start_len, self.gen_len))
+            hi = min(max(arg.target_len, lo + 1), self.gen_len)
+            self.reward_fn.sampler = LengthSampler(min_value=lo, max_value=hi + 1)
+        # 其余情况（给了固定目标长度、或使用 completion 奖励）不需要采样
+        if self.master_process:
+            sampler_desc = (
+                f"每条随机采样目标长度 [{self.reward_fn.sampler.values[0]}, "
+                f"{self.reward_fn.sampler.values[-1]}]"
+                if self.reward_fn.sampler is not None else f"固定目标长度 {target_len}"
+            )
+            print(
+                "📣 PPO 配置："
+                f"rollout={rollout_size} × {arg.ppo_epochs} epoch（mini-batch={mini_batch_size}）、"
+                f"prompt={arg.start_len} tok、生成={self.gen_len} tok、"
+                f"奖励={arg.ppo_reward}（{sampler_desc}）、KL 系数 {arg.init_kl_coef}、lr {lr:g}"
+            )
+
     # -----------------------------------------------------------------
     # 👉 4. 训练循环
         '''
@@ -742,6 +1043,9 @@ class TinyStoriesTrainer:
     def train(self):
         # 【工厂总控】获取训练配置参数（相当于生产车间的操作手册）
         arg = self.arg
+        # 🛠️ 新增分发：--ppo 时走真正的强化学习循环（原来只换了模型头，损失仍是交叉熵）
+        if arg.ppo:
+            return self.train_ppo()
         # 🛠️ 用 _next_batch 复用同一个长生命周期迭代器（原代码每次 next(iter_batches(...))
         #    都会新建 DataLoader / 重启 worker 进程，见 _build_dataloader 里的说明）
         next_batch = self._next_batch  # 原材料供应管道（数据批次生成器）
@@ -769,7 +1073,7 @@ class TinyStoriesTrainer:
         # === 核心训练循环（生产线主流程） ===
         while True:
             # --- 动态学习率调节（类似健身时的强度调整）---
-            lr = get_lr(iter_num, arg) if arg.decay_lr else arg.learning_rate  # 获取当前学习率
+            lr = get_lr(iter_num, arg, self.target_iters) if arg.decay_lr else arg.learning_rate  # 获取当前学习率
             for pg in self.optimizer.param_groups:  # 更新所有参数组的学习率[for DDP不同GPU分工]
                 pg["lr"] = lr  # 相当于调整健身动作的幅度
 
@@ -783,12 +1087,14 @@ class TinyStoriesTrainer:
                     best_val_loss = losses["val"]  # 更新最佳记录
                     if iter_num > 0:  # 首次迭代不保存
                         ckpt = {  # 存档内容
-                            "model": self.raw_model.state_dict(),      # 生产线当前参数
+                            # 🛠️ 存“未编译”的模块：否则 --compile 会把参数名变成
+                            #    `_orig_mod.xxx` 写进 ckpt，续训/采样时都得额外剥前缀
+                            "model": self.unoptimized_model.state_dict(),  # 生产线当前参数
                             "optimizer": self.optimizer.state_dict(),  # 优化器状态（动量等）
                             # 🛠️ 原来是 asdict(arg)：arg 是 argparse.Namespace 不是 dataclass，
                             #    这行会抛 TypeError（asdict() should be called on dataclass
                             #    instances），也就是第一次评估保存 checkpoint 时必崩。
-                            "model_args": config_to_dict(arg),         # 生产配置参数
+                            "model_args": checkpoint_args(arg, self.unoptimized_model),  # 生产配置参数（以模型真实结构为准）
                             "iter_num": iter_num,                      # 当前批次编号
                             "best_val_loss": best_val_loss,            # 最佳质检成绩
                         }
@@ -836,7 +1142,7 @@ class TinyStoriesTrainer:
             t0 = t1  # 重置计时器
             iter_num += 1  # 更新批次计数器
 
-            if iter_num > arg.max_iters:  # 达到最大训练次数时停机
+            if iter_num > self.target_iters:  # 达到目标步数时停机
                 break
 
         # === 生产收尾工作 ===
@@ -845,6 +1151,218 @@ class TinyStoriesTrainer:
         if self.master_process:  # 主控台最终报告
             print("🏁 训练完成！最新模型与日志已保存在", arg.out_dir)
 
+
+    # -----------------------------------------------------------------
+    # 👉 4.5 PPO 训练循环（真正的强化学习微调：rollout → 奖励 → GAE → clip 更新）
+    # -----------------------------------------------------------------
+    def _rollout(self):
+        """
+        采样一批 (prompt, response)：
+          prompt 取自训练集里真实故事的开头（前 start_len 个 token），
+          response 由当前策略模型用 KV cache 生成，
+          score 由 self.reward_fn 打分（长度 / 结尾完整性 / 两者相加）。
+        """
+        arg = self.arg
+        if arg.ppo_prompt_file:
+            prompts = self._prompts_from_file(b=arg.ppo_rollout_size)
+        else:
+            X, _ = self._next_batch("train")        # [B, T] 真实故事 token
+            b = min(arg.ppo_rollout_size, arg.batch_size, X.shape[0])
+            # 🛠️ prompt 统一取 start_len 个 token：批生成时不会出现 padding，
+            #    KV cache 里也就不会混入 pad token（见 ppo/generate 相关注释）。
+            prompts = [X[i, :arg.start_len].tolist() for i in range(b)]
+
+        self.model.eval()                            # 采样阶段：关闭 dropout、走 eval 分支
+        with torch.no_grad():
+            eos_id = self.enc.eos_id if self.enc.eos_id is not None else self.enc.bos_id
+            full_seqs = self.model.generate_withcache(
+                prompts,
+                max_gen_len=self.gen_len,
+                temperature=arg.ppo_temperature,
+                top_k=arg.ppo_top_k,
+                top_p=arg.ppo_top_p,
+                eos_id=eos_id,
+                echo=False,                          # 只取新生成的 response（prompt 不返回）
+                device=arg.device,
+            )
+
+        queries, responses, scores = [], [], []
+        for prompt, seq in zip(prompts, full_seqs):
+            resp = list(seq)                         # echo=False → seq 已经是纯 response
+            if not resp:                             # 兜底：至少一个 token 才能算 logprob
+                resp = [self.enc.bos_id]
+            queries.append(torch.tensor(prompt, dtype=torch.long))
+            responses.append(torch.tensor(resp, dtype=torch.long))
+            scores.append(torch.tensor([self.reward_fn(resp)], dtype=torch.float32))
+        return queries, responses, scores
+
+    def _ppo_eval_batch(self, split="val"):
+        """
+        PPO 质量监控用的**小批量**数据流。
+
+        🛠️ 为什么单独建一条：训练用的 batch_size 默认 128、max_seq_len 默认 256，
+           一次评估前向（128×256=32768 token）在 2 核 CPU 上要 ~3 秒，
+           而监控只需要看趋势 —— 16×256 就够。实测 B=16/T=48 的前向只要 ~25ms，
+           规模差 40 倍以上再叠加注意力的 T² 项，3 秒完全对得上，不是 bug。
+        """
+        if not hasattr(self, "_ppo_eval_iters"):
+            self._ppo_eval_iters = {}
+        if split not in self._ppo_eval_iters:
+            arg = self.arg
+            iters = partial(
+                Task.iter_batches,
+                batch_size=arg.ppo_eval_batch_size,
+                max_seq_len=min(arg.max_seq_len, 256),
+                vocab_size=arg.vocab_size,
+                vocab_source=arg.vocab_source,
+                device=arg.device,
+                num_workers=0,          # 评估批次小，起 worker 不划算
+            )
+            self._ppo_eval_iters[split] = iter(iters(split=split))
+        return next(self._ppo_eval_iters[split])
+
+    def _prompts_from_file(self, b: int):
+        """
+        从 --ppo_prompt_file 读取 prompt：每行一条故事开头，编码后截断到 start_len 个 token。
+        返回等长的 token 列表（等长 → 批生成无 padding，KV cache 干净）。
+        """
+        arg = self.arg
+        if getattr(self, "_prompt_pool", None) is None:
+            with open(arg.ppo_prompt_file, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            pool = []
+            for ln in lines:
+                ids = self.enc.encode(ln, bos=True, eos=False)
+                if len(ids) < arg.start_len:  # 太短的 prompt 直接跳过（避免凑长度引入噪声）
+                    continue
+                pool.append(ids[:arg.start_len])
+            assert pool, (
+                f"{arg.ppo_prompt_file} 里没有长度 ≥ start_len({arg.start_len}) 的 prompt，"
+                f"请调小 --start_len 或补充更长的数据"
+            )
+            self._prompt_pool = pool
+            if self.master_process:
+                print(f"📄 从 {arg.ppo_prompt_file} 载入 {len(pool)} 条 prompt（每条截断到 {arg.start_len} token）")
+        pool = self._prompt_pool
+        idx = np.random.randint(0, len(pool), size=b)  # 每步随机采样一批
+        return [list(pool[i]) for i in idx]
+
+    def _ppo_checkpoint(self, iter_num: int, best_val_loss: float, stats: dict):
+        """保存 PPO checkpoint（含 KL 系数，续训时 KL 惩罚不会从头再来）。"""
+        arg = self.arg
+        path = os.path.join(arg.out_dir, "ppo_ckpt.pt")
+        torch.save(
+            {
+                "model": self.unoptimized_model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "model_args": checkpoint_args(arg, self.unoptimized_model),
+                "iter_num": iter_num,
+                "best_val_loss": best_val_loss,
+                "kl_coef": float(self.ppo_trainer.kl_ctl.value),
+                "ppo_stats": {k: float(v) for k, v in stats.items() if isinstance(v, (int, float))},
+            },
+            path,
+        )
+        return path
+
+    def train_ppo(self):
+        """
+        PPO 主循环：每个 step 做一次「采样 rollout → 计算 KL/GAE → clip 更新」。
+
+        🛠️ 本轮新增，把 ppo.py 的 PPOTrainer 真正接进 train.py。
+           数据流：训练集取 prompt → 策略生成 response → 奖励打分 → PPOTrainer.step()
+                  （内部完成 π_ref 前向、KL 惩罚、GAE、PPO-clip 损失、梯度累积与更新）
+        """
+        arg = self.arg
+        # DDP 下各 rank 各自采样数据（数据并行），梯度同步交给 PPOTrainer.step() 内部处理
+        iter_num = getattr(self, "iter_num", 0)
+        best_val_loss = getattr(self, "best_val_loss", 1e9)
+
+        # 🛠️ 目标步数兜底：resume 时 ckpt 里的 iter_num 常常已经 ≥ max_iters（例如接着
+        #    iter 98000 的模型做 PPO，而 max_iters 只有几千），若按“总步数”解释就会一步不跑。
+        #    PPO 是新一轮微调，这里默认按“本阶段再训 max_iters 步”处理，并明确打印出来。
+        target_iters = self.target_iters
+        if arg.init_from == "resume" and iter_num >= target_iters and not arg.iters_from_now:
+            target_iters = iter_num + arg.max_iters
+            if self.master_process:
+                print(f"ℹ️ 检测到 ckpt 已训练 {iter_num} 步 ≥ max_iters({arg.max_iters})，"
+                      f"本轮按「再训 {arg.max_iters} 步」处理 → 目标 {target_iters} 步"
+                      f"（如需其它语义请显式使用 --iters_from_now）")
+        if self.master_process:
+            print(f"🚀 开始 PPO 训练：{iter_num} → {target_iters} 步，"
+                  f"每个 step 采样 {self.ppo_config.batch_size} 条")
+
+        t0 = time.time()
+        stats = {}
+        while True:
+            # --- 学习率：PPO 阶段通常固定 lr（--decay_lr=False）---
+            lr = get_lr(iter_num, arg, target_iters) if arg.decay_lr else self.ppo_config.learning_rate
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = lr
+
+            # 🛠️ 学习率为 0 时给一次明确警告：这会让 PPO 全程不更新参数（比报错更隐蔽）
+            if lr == 0.0 and not getattr(self, "_warned_zero_lr", False):
+                self._warned_zero_lr = True
+                if self.master_process:
+                    print("⚠️ 当前学习率为 0（decay_lr 已把 lr 衰减到 min_lr），PPO 不会更新参数！"
+                          "请设置 --min_lr>0、--decay_lr=False 或加大 --max_iters/使用 --iters_from_now")
+
+
+            # --- ① 采样 rollout（prompt + response + reward）---
+            queries, responses, scores = self._rollout()
+
+            # --- ② 一次 PPO 更新（内部：π_ref 前向 → KL 惩罚 → GAE → clip 损失 → 反向）---
+            stats = self.ppo_trainer.step(queries=queries, responses=responses, scores=scores)
+
+            # --- ③ 日志 ---
+            t1 = time.time()
+            if iter_num % arg.log_interval == 0 and self.master_process:
+                rewards = [float(s.mean()) for s in scores]
+                print(
+                    f"[PPO] step {iter_num} | 奖励 {stats['ppo/reward_all']:+.3f} "
+                    f"(本批 {np.mean(rewards):+.3f} ± {np.std(rewards):.3f}) "
+                    f"| KL_ref {stats['ppo/kl_ref']:+.4f} | policykl {stats.get('ppo/policy/policykl', float('nan')):+.4f} "
+                    f"| 熵 {stats.get('ppo/policy/entropy', float('nan')):.3f} "
+                    f"| clipfrac {stats.get('ppo/policy/clipfrac', float('nan')):.3f} "
+                    f"| loss {stats.get('ppo/loss/total', float('nan')):+.4f} "
+                    f"| 响应长度 {np.mean([len(r) for r in responses]):.1f} "
+                    f"| lr {lr:.2e} | {(t1 - t0) * 1000:.0f} ms"
+                )
+                # 让 RL 的效果肉眼可见：每隔一段时间打印一条真实生成结果
+                if arg.ppo_debug:
+                    sample = self.enc.decode(responses[0].tolist()).strip()
+                    print(f"       └─ 样例（奖励 {rewards[0]:+.3f}）：{sample[:120]}")
+            t0 = t1
+            iter_num += 1
+
+            # --- ④ 质量监控：用验证集 CE 损失看语言能力有没有被 RL 练坏 ---
+            # （RL 微调的常见事故就是奖励涨了、但模型不会说人话了；这里给一个显式指标）
+            if arg.eval_iters > 0 and iter_num % arg.eval_interval == 0 and self.master_process:
+                try:
+                    n_eval = min(arg.eval_iters, 10)   # PPO 阶段不必跑满 eval_iters，够看趋势即可
+                    old_eval_iters, arg.eval_iters = arg.eval_iters, n_eval
+                    try:
+                        losses = estimate_loss(self.model, self._ppo_eval_batch, self.ctx, arg)
+                        print(f"  📊 CE 损失（质量监控）：train {losses['train']:.4f} | val {losses['val']:.4f}")
+                    finally:
+                        arg.eval_iters = old_eval_iters
+                except Exception as e:
+                    if not getattr(self, "_warned_ppo_eval", False):
+                        self._warned_ppo_eval = True
+                        print(f"  ⚠️ PPO 质量监控已跳过（{type(e).__name__}: {e}）")
+
+            # --- ⑤ 存档（PPO 阶段按 eval_interval 定期保存最新模型）---
+            if (iter_num % arg.eval_interval == 0 or iter_num >= target_iters) and self.master_process:
+                path = self._ppo_checkpoint(iter_num, best_val_loss, stats)
+                print(f"💾 已保存 {path}（含 KL 系数 {self.ppo_trainer.kl_ctl.value:.4f}）")
+
+            if iter_num >= target_iters:
+                break
+
+        if self.ddp:
+            destroy_process_group()
+        if self.master_process:
+            print("🏁 PPO 训练完成！模型与日志已保存在", arg.out_dir)
 
 
 # -----------------------------------------------------------------------------

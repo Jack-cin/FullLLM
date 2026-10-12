@@ -59,17 +59,65 @@ python train.py \
 
 ## 3. 续训 / PPO 微调
 
+### 3.1 普通续训
+
 ```bash
-# 续训（自动在 out_dir 里找 ckpt.pt / ppo_ckpt.pt，也可用 --ckpt_path 显式指定）
-python train.py --init_from=resume --out_dir="outmini" --device=cuda --ppo \
+python train.py --init_from=resume --out_dir="outmini" --device=cuda \
     --learning_rate=1e-4 --max_iters=200000 --always_save_checkpoint
 ```
 
-> ⚠️ **注意当前状态**：`--ppo` 只是把模型换成 `TransformerWithValueHead`（多一个 value head）、
-> 并把 checkpoint 存成 `ppo_ckpt.pt`，训练目标仍然是**交叉熵**——仓库里还没有把 `ppo.py` 的
-> rollout/奖励/KL 串进 `train.py`。`PPOTrainer.step()` 本身是可用的（见 `tests/smoke_test.py::test_ppo_step_runs`），
-> 需要自己写 rollout：采样 prompt → `model.generate_withcache()` 生成 response → 用 `LengthReward`
-> 之类打分 → 调用 `PPOTrainer.step(queries, responses, scores)`。
+续训会自动在 `out_dir` 里按 `ppo_ckpt.pt → ckpt.pt` 查找（也可用 `--ckpt_path=...` 显式指定）；
+若 ckpt 里的 `iter_num` 已经 ≥ `--max_iters`（例如接着 iter 98000 的模型继续训），
+`--max_iters` 会被解释成「再训多少步」并打印提示，也可以用 `--iters_from_now` 显式声明该语义。
+
+### 3.2 真正的 PPO 微调（`--ppo`）
+
+`--ppo` 会启用 `ppo.py` 里的 `PPOTrainer`，跑完整的强化学习循环：
+**取 prompt → 策略模型采样 response → 奖励打分 → 参考模型算 KL → GAE → PPO-clip 更新**。
+
+```bash
+# 从预训练 ckpt 出发做 PPO（本仓库自带 data/ckpt.pt，可直接拿来试）
+python train.py --out_dir=out_ppo --device=cuda --dtype=bfloat16 \
+    --vocab_source=custom --vocab_size=512 --tokenizer_path=data/tok512.model \
+    --init_from=resume --ckpt_path=data/ckpt.pt \
+    --ppo \
+    --ppo_prompt_file=prompts.txt \        # 每行一条故事开头（留空则从训练集取真实故事开头）
+    --start_len=16 --target_len=48 --max_gen_len=48 \
+    --ppo_rollout_size=32 --ppo_mini_batch_size=8 --ppo_epochs=2 \
+    --ppo_lr=1e-4 --ppo_reward=repetition,length --ppo_temperature=0.9 \
+    --init_kl_coef=0.2 --target_kl=0.1 --ppo_early_stopping \
+    --max_iters=2000 --eval_interval=100 --log_interval=10
+```
+
+关键参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--ppo_reward` | 奖励函数，可逗号组合：`length`（长度对齐目标）/ `completion`（结尾是句末标点）/ `repetition`（n-gram 不重复率，专治小模型复读）；也支持 `both`、`all` |
+| `--ppo_prompt_file` | prompt 文本文件（每行一条）；不给则用训练集分片里的真实故事开头 |
+| `--ppo_rollout_size` | 每个 PPO step 采样多少条 (prompt, response)，不能超过 `batch_size` |
+| `--ppo_mini_batch_size` | 更新时的 mini-batch（默认 `rollout/8`） |
+| `--ppo_epochs` | 同一批 rollout 复用几轮 |
+| `--ppo_lr` | PPO 阶段学习率（0 = 沿用 `--learning_rate`）。PPO 阶段默认**不做**余弦衰减 |
+| `--init_kl_coef` / `--target_kl` | KL 惩罚系数 / 早停阈值（`--ppo_early_stopping` 时生效） |
+| `--ppo_kl_penalty` | `kl` / `abs` / `mse` / `full` |
+| `--ppo_eval_batch_size` | 质量监控（CE 损失）用的小批量，默认 16 |
+
+训练日志每 `--log_interval` 步打印一行，包含：
+奖励、`KL_ref`（策略相对参考模型的漂移）、`policykl`、熵、`clipfrac`（被裁剪的比率占比）、损失、平均响应长度。
+另外每 `--eval_interval` 步会用小批量算一次**验证集 CE 损失**——它是「奖励涨了但模型不会说人话」这类事故的第一预警。
+
+**调参建议**（都基于本仓库实测）：
+
+- 奖励从 `repetition` 或 `repetition,length` 起步：它是密集信号、马上能看出效果；
+  `completion` 对 512 词表的小模型过于稀疏（实测奖励长期恒为 0，几乎学不动）。
+- `--ppo_lr` 取预训练的 1/10 ~ 1/25（`5e-5 ~ 2e-4`），`--init_kl_coef 0.1~0.2`；
+  `KL_ref` 持续 > 10 说明漂移太大，调小 lr 或加大 KL 系数。
+- rollout 越大梯度越稳（`32~128`），但每步耗时线性增长；先用 `--ppo_rollout_size=16` 试通。
+- 奖励/长度都是「可被 hack 的目标」，所以训练中一定要同时看 CE 损失与生成样例（`--ppo_debug` 默认开启样例打印）。
+
+> 想换成自己的奖励（reward model / 人工偏好）：实现一个 `__call__(tokens) -> float` 的对象，
+> 在 `_build_ppo` 里替换 `self.reward_fn` 即可（见 `train.py::TinyStoriesReward`）。
 
 ## 4. 采样与导出
 
@@ -101,7 +149,7 @@ pytest tests/smoke_test.py -v
 见 [`OPTIMIZATION.md`](OPTIMIZATION.md)（本轮代码审计 + 已修复项 + 待办清单）。
 简要版：
 
-- `train.py --ppo` 未接真实 RL 循环（最大的一块功能缺口）；
-- DDP 下只有 rank0 做评估，其他 rank 会“超前”，严格说需要 barrier 或全 rank 评估；
+
+- DDP 下只有 rank0 做评估/存档，其他 rank 会“超前”（梯度同步靠 all-reduce 兜住）；
 - `compute_advantages` 里的 GAE 是 Python 逐 token 循环（可向量化，但要小心数值稳定性）；
-- 暂无 wandb/tensorboard 接入、暂无学习率/梯度监控面板。
+- 暂无 wandb/tensorboard 接入（指标目前打 stdout，便于接任意 logger）。

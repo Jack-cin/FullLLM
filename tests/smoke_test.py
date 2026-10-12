@@ -33,12 +33,13 @@ from model import (  # noqa: E402
     apply_rotary_emb,
     precompute_freqs_cis,
 )
-from ppo import PPOConfig, PPOTrainer  # noqa: E402
+from ppo import LengthSampler, PPOConfig, PPOTrainer  # noqa: E402
 from tinystories import get_tokenizer_model_path  # noqa: E402
 from tokenizer import Tokenizer  # noqa: E402
 from train import (  # noqa: E402
     TinyStoriesTrainer,
     TrainConfig,
+    build_reward_fn,
     config_to_dict,
     load_model_state,
     resolve_ckpt_path,
@@ -206,8 +207,32 @@ def test_generate_withcache_matches_greedy_reference():
             idx = torch.cat([idx, nxt], dim=1)
         reference = idx[0].tolist()
 
-    # generate_withcache 返回的是「prompt + 新生成」的完整序列（echo 只影响是否再拼一次 prompt）
-    assert cached[len(prompt[0]):] == reference[len(prompt[0]):]
+    # echo=False → 只返回新生成的 response（prompt 不再重复拼接，见 echo 语义修复）
+    assert cached == reference[len(prompt[0]):]
+
+
+def test_generate_handles_prefix_eos_and_echo_semantics():
+    """
+    回归测试：两个真实踩过的坑
+      1. prompt 本身以 eos/bos id 开头时，不能被当成“生成结束”而把输出整段吞掉
+         （旧代码在整条序列里找 eos → 命中 prompt 第一个 token → 输出变空，
+           这就是 sample.py 打印空白的原因）；
+      2. echo=True 应返回「prompt + 生成」，echo=False 只返回生成部分（旧代码两者都错）。
+    """
+    model = Transformer(tiny_args(cache=True)).eval()
+    prompt = [1, 5, 6, 7]        # 1 = 本项目分词器的 eos/bos id
+    gen_kw = dict(max_gen_len=5, temperature=0.0, top_k=0, top_p=0.0, device="cpu")
+
+    with torch.no_grad():
+        # eos_id=1 与 prompt 首 token 相同：只应在「生成段」里找 eos
+        out = model.generate_withcache([prompt], eos_id=1, echo=True, **gen_kw)[0]
+        assert len(out) > 5, f"prompt 里的 eos 把输出吞掉了：{out}"      # 旧实现只会返回 [1]
+
+        full = model.generate_withcache([prompt], eos_id=2, echo=True, **gen_kw)[0]
+        resp = model.generate_withcache([prompt], eos_id=2, echo=False, **gen_kw)[0]
+    assert full[: len(prompt)] == prompt, "echo=True 应包含 prompt"
+    assert len(full) > len(prompt)
+    assert resp == full[len(prompt):], "echo=False 应恰好是生成部分"
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +356,90 @@ def test_ppo_step_runs():
 
 
 # ---------------------------------------------------------------------------
-# 5. sample.py 命令行
+# 5. PPO 训练循环（train.py --ppo 现在是真的 RL 微调，而不是换了个头的交叉熵）
+# ---------------------------------------------------------------------------
+def test_reward_fn_variants():
+    """奖励函数三种模式都要能出分，且长度奖励随目标长度变化。"""
+    enc = Tokenizer(str(REPO / "data" / "tok512.model"))
+    tokens = enc.encode("Once upon a time there was a little girl.", bos=False, eos=False)
+
+    length_reward = build_reward_fn("length", target_len=len(tokens), enc=enc)
+    assert abs(length_reward(tokens) - 0.0) < 1e-6           # 长度完全命中 → 0 分
+    assert length_reward(tokens + tokens) < 0                # 太长 → 负分
+
+    completion = build_reward_fn("completion", target_len=10, enc=enc)
+    assert completion(tokens) == 1.0                         # 结尾是 "." → 给分
+    assert completion(enc.encode("Once upon a", bos=False, eos=False)) == 0.0
+
+    both = build_reward_fn("both", target_len=len(tokens), enc=enc)
+    assert abs(both(tokens) - 1.0) < 1e-6                    # 长度 0 分 + 结尾 1 分
+
+    # 带 sampler 时目标长度按样本采样（ppo.py 自带的 LengthSampler 是左闭右开区间）
+    sampled = build_reward_fn("length", target_len=10, enc=enc, sampler=LengthSampler(0, 5))
+    assert sampled.current_target() in (0, 1, 2, 3, 4)
+
+
+def test_rollout_shapes_and_rewards(workdir):
+    """rollout 的 prompt/response/score 形状要满足 PPOTrainer.step 的硬性要求。"""
+    with chdir(workdir):
+        arg = _train_args(ppo=True, max_iters="1", ppo_rollout_size="3",
+                          ppo_mini_batch_size="2", start_len="8", target_len="12",
+                          max_gen_len="12")
+        trainer = TinyStoriesTrainer(arg)
+        queries, responses, scores = trainer._rollout()
+
+    assert len(queries) == len(responses) == len(scores) == trainer.ppo_config.batch_size == 3
+    assert all(len(q) == arg.start_len for q in queries)          # prompt 等长 → 批生成无 padding
+    assert all(0 < len(r) <= trainer.gen_len + 1 for r in responses)
+    assert all(s.shape == (1,) and torch.isfinite(s).all() for s in scores)
+
+
+def test_ppo_training_loop_writes_checkpoint_with_kl_coef(workdir, capsys):
+    """
+    端到端 PPO：合成数据 → rollout → 奖励 → PPOTrainer.step → ppo_ckpt.pt。
+    修复前：train.py --ppo 只换模型头，ppo.py 从未被调用（这条测试会直接找不到 ppo_ckpt.pt）。
+    """
+    with chdir(workdir):
+        arg = _train_args(ppo=True, max_iters="2", eval_interval="1", log_interval="1",
+                          ppo_rollout_size="4", ppo_mini_batch_size="2", ppo_epochs="1",
+                          ppo_grad_accum_steps="1", start_len="8", target_len="12",
+                          max_gen_len="12", ppo_temperature="1.0", ppo_lr="1e-4")
+        trainer = TinyStoriesTrainer(arg)
+        trainer.train()
+
+        ckpt_path = workdir / "out_smoke" / "ppo_ckpt.pt"
+        assert ckpt_path.exists(), "PPO 训练没有产出 ppo_ckpt.pt"
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        assert ckpt["iter_num"] >= 1
+        assert "kl_coef" in ckpt and np.isfinite(ckpt["kl_coef"])
+        assert "ppo_stats" in ckpt and np.isfinite(ckpt["ppo_stats"]["ppo/reward_all"])
+        # 保存的必须是「未编译/未包装」的干净权重名（不能再有 _orig_mod. 前缀）
+        assert not any(k.startswith("_orig_mod.") for k in ckpt["model"])
+
+        out = capsys.readouterr().out
+        assert "PPO 配置" in out and "[PPO] step" in out and "已保存" in out
+
+
+def test_ppo_resume_restores_kl_coef(workdir):
+    """续训时要能恢复 KL 系数（否则每轮重启 KL 惩罚都从头开始）。"""
+    src = workdir / "out_smoke" / "ppo_ckpt.pt"
+    assert src.exists(), "依赖 test_ppo_training_loop_writes_checkpoint_with_kl_coef 先生成 ckpt"
+
+    with chdir(workdir):
+        ckpt = torch.load(src, map_location="cpu")
+        ckpt["kl_coef"] = 0.1234
+        torch.save(ckpt, src)
+
+        arg = _train_args(ppo=True, init_from="resume", max_iters="0", eval_interval="1",
+                          ppo_rollout_size="4", ppo_mini_batch_size="2", start_len="8",
+                          target_len="12", max_gen_len="12")
+        trainer = TinyStoriesTrainer(arg)
+
+    assert abs(trainer.ppo_trainer.kl_ctl.value - 0.1234) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 6. sample.py 命令行
 # ---------------------------------------------------------------------------
 def test_sample_cli_runs():
     """原 sample.py 依赖不存在的 configurator.py，且读 ckpt['config'] 会 KeyError。"""

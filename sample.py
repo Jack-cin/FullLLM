@@ -121,8 +121,10 @@ def main():
                 temperature=args.temperature,
                 top_k=args.top_k,
                 top_p=args.top_p if args.top_p > 0 else 0.0,
-                eos_id=enc.bos_id,
-                echo=False,
+                # 🛠️ 原来传的是 enc.bos_id：本项目自定义分词器里 bos=1、eos=2，
+                #    用 bos 当 eos 会把 prompt 的第一个 token 当成结束符，输出直接变空。
+                eos_id=enc.eos_id,
+                echo=False,     # 只要新生成的部分（prompt 已经单独打印过）
                 device=args.device,
             )
             generated_tokens += len(y[0])
