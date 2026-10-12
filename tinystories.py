@@ -396,8 +396,17 @@ class Task:
         '''
 
         ds = PretokDataset(**dataset_kwargs)
+        # 🛠️ pin_memory 只在真的往 GPU 搬数据时才划算：CPU 训练时它只是白占一块锁页内存
+        #    （并且会让 DataLoader 多做一次拷贝）。这里按 device 判断。
+        use_pin_memory = "cuda" in str(device)
         dl = torch.utils.data.DataLoader(
-            ds, batch_size=batch_size, pin_memory=True, num_workers=num_workers
+            ds,
+            batch_size=batch_size,
+            pin_memory=use_pin_memory,
+            num_workers=num_workers,
+            # 🛠️ worker 常驻 + 预取，避免每个 epoch 重新 fork 进程（num_workers=0 时自动忽略）
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         )
         for x, y in dl: #x:(batch_size,max_seq_len) #y:(batch_size,max_seq_len)
             x = x.to(device, non_blocking=True)

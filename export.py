@@ -357,7 +357,14 @@ def load_checkpoint(checkpoint):
 
     # load the provided model checkpoint
     checkpoint_dict = torch.load(checkpoint, map_location='cpu')
-    gptconf = ModelArgs(**checkpoint_dict['model_args'])
+    # 🛠️ 兼容两种 ckpt 结构：train.py 存 "model_args"，llama2.c 风格存 "config"
+    saved = checkpoint_dict.get('model_args') or checkpoint_dict.get('config') or {}
+    saved = dict(saved) if isinstance(saved, dict) else vars(saved)
+    # 🛠️ train.py 存的是整个训练配置（batch_size / learning_rate ...），
+    #    直接 ModelArgs(**saved) 会 TypeError: unexpected keyword argument 'batch_size'。
+    #    这里只挑出模型结构相关的字段。
+    valid = set(ModelArgs().__dict__.keys())
+    gptconf = ModelArgs(**{k: v for k, v in saved.items() if k in valid})
     model = Transformer(gptconf)
     state_dict = checkpoint_dict['model']
     unwanted_prefix = '_orig_mod.'

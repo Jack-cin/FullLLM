@@ -110,6 +110,11 @@ class PPOConfig:
     target_kl: float = 0.1  # 提前停止的KL散度目标值
     ratio_threshold: float = 1.5  # PPO比率的阈值，用于防止梯度爆炸
     whiten_rewards: bool = False  # 是否对奖励进行白化处理（增强训练稳定性）
+    # 🛠️ 新增 horizon：AdaptiveKLController 需要它来计算 KL 系数的调整幅度。
+    #    原代码在 adap_kl_ctrl=True 时会访问 self.config.horizon，
+    #    而 PPOConfig 里根本没有这个字段 → AttributeError（自适应 KL 控制完全不可用）。
+    #    默认值 10000 与 OpenAI summarize-from-feedback 的实现保持一致。
+    horizon: int = 10000  # 自适应KL控制的时间范围（adap_kl_ctrl=True 时生效）
 
     # 运行时计算的超参数，初始化时不需要设置
     backward_batch_size: tyro.conf.Suppress[int] = None  # 反向传播中使用的批量大小
@@ -135,14 +140,28 @@ class PPOTrainer():
         is_ddp: bool = False,
     ):
         # 初始化训练器，设置随机种子和配置
-        np.random.seed(config.seed)
+        # 🛠️ 原代码先执行 np.random.seed(config.seed) 再执行 self.config = config or PPOConfig()：
+        #    config 传 None 时会直接 AttributeError（无法用默认配置构造训练器）。
+        #    这里先解析配置，再设置随机种子。
         self.config = config or PPOConfig()  # 如果没有传入配置，使用默认配置
+        np.random.seed(self.config.seed)
         self.model = model  # 使用的语言模型
         self.ref_model = ref_model  # 参考模型，用于计算KL惩罚
         self.tokenizer = tokenizer  # 用于文本的tokenizer
         self.optimizer = optimizer  # 优化器，用于更新模型参数
         self.scaler = scaler  # 用于自动混合精度训练的梯度缩放器
         self.is_ddp = is_ddp  # 是否使用分布式数据并行（DDP）
+
+        # 🛠️ 运行时批量大小原来完全没人计算：PPOConfig 里 backward_batch_size /
+        #    global_backward_batch_size / global_batch_size 默认都是 None，
+        #    而 step() 里直接 `range(0, bs, self.config.backward_batch_size)` 会 TypeError。
+        #    这里按 trl/OpenAI 的口径在构造时就补上，step() 开箱即用。
+        if self.config.backward_batch_size is None:
+            self.config.backward_batch_size = max(1, self.config.mini_batch_size * self.config.gradient_accumulation_steps)
+        if self.config.global_backward_batch_size is None:
+            self.config.global_backward_batch_size = self.config.backward_batch_size
+        if self.config.global_batch_size is None:
+            self.config.global_batch_size = self.config.batch_size
 
         # 根据配置选择KL控制方式
         if self.config.adap_kl_ctrl:
@@ -421,7 +440,10 @@ class PPOTrainer():
         train_stats = stack_dicts(all_stats)  # ㉑ 把多个 mini-batch 的 dict 堆叠
         stats = {}
         for k, v in train_stats.items():  # ㉒ 取均值写入最终日志键
-            stats[f"ppo/{k}"] = float(torch.mean(v, axis=0).detach().cpu().numpy()[0])
+            # 🛠️ 配合 stack_dicts 的 NaN 填充改用 nanmean（并兼容统计量不止一个元素的情况，
+            #    原实现直接取 [0] 会丢掉其余元素）
+            v_mean = torch.nanmean(v.float(), dim=0)
+            stats[f"ppo/{k}"] = float(v_mean.mean().detach().cpu().numpy())
         timing["time/ppo/calc_stats"] = time.time() - t
 
         # ㉓ 额外指标
@@ -927,8 +949,12 @@ def stack_dicts(stats_dicts):
     results = dict()
     for k in stats_dicts[0]:
         # 将每个字典的值展平并填充到一个 batch 中
-        stats_list = [torch.flatten(d[k]) for d in stats_dicts]
-        results[k] = pad_sequence(stats_list, batch_first=True, padding_value=-1)  # 将值堆叠在一起，并填充缺失值
+        # 🛠️ 原来 padding_value=-1：当各个 mini-batch 的统计量形状不一致时
+        #    （比如最后一个 batch 更小），-1 会被当成真实数值参与后面的 mean，
+        #    日志里的 loss / kl / clipfrac 等指标会被污染（甚至出现负 loss）。
+        #    改成 NaN 填充，后面用 nanmean 聚合。
+        stats_list = [torch.flatten(d[k]).float() for d in stats_dicts]
+        results[k] = pad_sequence(stats_list, batch_first=True, padding_value=float("nan"))  # 用 NaN 填充缺失值
     return results
 
 

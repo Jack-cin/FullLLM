@@ -72,9 +72,17 @@ def apply_rotary_emb(
     freqs_sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # 应用旋转位置编码（RoPE）到查询和键的向量中
-    # 先将查询（xq）和键（xk）张量按复数形式拆解（实部和虚部）
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+    # 🛠️ 原实现无条件执行 `xq.float()` + 结尾 `.type_as(xq)`，也就是每个 head、每一层
+    #    都要做两次 dtype 往返转换（fp32 场景纯属浪费；bf16 场景靠类型提升仍会升到 fp32）。
+    #    这里只在 fp16 下保留“升到 fp32 计算”的数值保护，其余情况不再无谓转换。
+    #    数学结果完全一致（freqs 本身是 fp32，bf16 乘法会自动提升到 fp32）。
+    if xq.dtype == torch.float16:
+        xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
+        xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+    else:
+        # 先将查询（xq）和键（xk）张量按复数形式拆解（实部和虚部）
+        xq_r, xq_i = xq.reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
+        xk_r, xk_i = xk.reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
 
     # 调整频率矩阵的形状以便广播
     freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
@@ -160,7 +168,11 @@ class Attention(nn.Module):
         freqs_sin: torch.Tensor,
         mask: Optional[torch.Tensor],
         cache: Optional[bool] = False,
+        is_causal: bool = False,
     ):
+        # 🛠️ 新增 is_causal 参数：整段前向且 start_pos=0 时不再构造 [T,T] 的 -inf mask，
+        #    直接告诉 SDPA “这是因果注意力”，可以走 FlashAttention 的因果内核
+        #    （少一次 mask 构造 + 少 [B,H,T,T] 级别的加性 mask 物化，长序列下明显更快、更省显存）。
         bsz, seqlen, _ = x.shape  # 获取批次大小和序列长度
 
         # 计算查询、键、值
@@ -175,8 +187,12 @@ class Attention(nn.Module):
         # 如果启用了缓存，则保存当前的键和值，以备下次使用
         if cache and not self.training:
             assert self.cache, "cache must be enabled"
-            self.cache_k = self.cache_k.to(xq)
-            self.cache_v = self.cache_v.to(xq)
+            # 🛠️ 原实现每一步（每个增量解码 token）都执行 cache_k.to(xq)：
+            #    device/dtype 一致时它虽然不会真的拷贝，但会在 torch.compile 的图里
+            #    表现为动态的 dtype 分支/潜在重分配。改成“只在真的不一致时搬一次”。
+            if self.cache_k.device != xq.device or self.cache_k.dtype != xq.dtype:
+                self.cache_k = self.cache_k.to(xq)
+                self.cache_v = self.cache_v.to(xq)
 
             self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
             self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
@@ -196,9 +212,19 @@ class Attention(nn.Module):
         # 使用flash attention（快速实现）或者慢速实现
         if self.flash:
             # 使用flash attention（PyTorch中优化的点积注意力）
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
+            # 🛠️ is_causal=True 时传 attn_mask=None（两者同时给在新版 torch 会直接报错），
+            #    由内核内部完成因果屏蔽；只有增量解码（带 cache / start_pos>0）才用显式 mask。
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=None if is_causal else mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=is_causal,
+            )
         else:
             # 手动实现注意力计算
+            if mask is None:  # 慢速实现必须有显式 mask（torch<2.0 没有 SDPA 因果内核）
+                mask = torch.full((seqlen, seqlen), float("-inf"), device=xq.device)
+                mask = torch.triu(mask, diagonal=1).type_as(xq)
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)  # 计算注意力分数
             scores = scores + mask  # 使用mask来排除无效位置
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)  # 使用softmax计算注意力权重
@@ -253,10 +279,10 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)  # 注意力层的归一化
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)  # 前馈层的归一化
 
-    def forward(self, x, start_pos, freqs_cos, freqs_sin, mask, cache):
+    def forward(self, x, start_pos, freqs_cos, freqs_sin, mask, cache, is_causal: bool = False):
         # Transformer块的前向传播：通过注意力层和前馈层计算输出
         # 先将输入加上注意力层的输出（残差连接）
-        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask, cache)
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask, cache, is_causal)
         # 再将结果加上前馈层的输出（再次使用残差连接）
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -312,19 +338,28 @@ class Transformer(nn.Module):
         freqs_cos = self.freqs_cos[start_pos : start_pos + seqlen]
         freqs_sin = self.freqs_sin[start_pos : start_pos + seqlen]
 
-        # 创建mask矩阵，用于屏蔽掉当前时间步之前的token（自回归）
-        mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=tokens.device
-            )
-        mask = torch.triu(mask, diagonal=1)  # 上三角矩阵，保证当前位置只能看到之前的token
-        mask = torch.hstack([
-            torch.zeros((seqlen, start_pos), device=tokens.device),
-            mask
-        ]).type_as(h)  # 拼接前置部分，形成完整的mask
+        # 🛠️ mask 只在“需要”的时候才构造：
+        #    * 整段前向（start_pos==0、不走 cache）→ 交给 SDPA 的 is_causal=True，
+        #      省掉 [T,T] 的 -inf 矩阵构造与物化，长序列下更快、更省显存；
+        #    * 带 KV cache 的增量解码（seqlen 通常=1）→ 必须显式给出因果 + 前缀 mask。
+        use_causal_fastpath = (start_pos == 0) and (not cache) and (seqlen > 1)
+        mask = None
+        if not use_causal_fastpath:
+            # 创建mask矩阵，用于屏蔽掉当前时间步之前的token（自回归）
+            mask = torch.full(
+                    (seqlen, seqlen), float("-inf"), device=tokens.device
+                )
+            mask = torch.triu(mask, diagonal=1)  # 上三角矩阵，保证当前位置只能看到之前的token
+            if start_pos > 0:
+                mask = torch.hstack([
+                    torch.zeros((seqlen, start_pos), device=tokens.device),
+                    mask
+                ])  # 拼接前置部分，形成完整的mask
+            mask = mask.type_as(h)
 
         # 将输入通过每一层TransformerBlock进行前向传播
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cos, freqs_sin, mask, cache)
+            h = layer(h, start_pos, freqs_cos, freqs_sin, mask, cache, use_causal_fastpath)
         h = self.norm(h)  # 最后的归一化
 
         if targets is not None:
@@ -332,7 +367,10 @@ class Transformer(nn.Module):
             logits = self.output(h)  # 通过线性层输出
             last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)  # 计算交叉熵损失
         else:
-            logits = self.output(h)  # 没有目标时，只进行推理
+            # 🛠️ 生成场景（cache=True 且在 eval 模式）只需要最后一个位置的 logits，
+            #    但原代码对整段 prompt 都做了 vocab 投影：vocab=32000、T=512 时，
+            #    这一下就是几 GFLOP 的纯浪费。这里只投影最后一个位置（值域/梯度不受影响）。
+            logits = self.output(h[:, -1:, :] if (cache and not self.training) else h)
             last_loss = None
 
         return logits, h, last_loss  # 返回logits、最后的隐藏状态和损失

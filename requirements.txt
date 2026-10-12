@@ -1,6 +1,14 @@
-numpy==1.23.5
-pytest==7.4.0
-Requests==2.31.0
-sentencepiece==0.1.99
-torch==2.0.1
-tqdm==4.64.1
+# 训练/推理依赖（nanoGPT-style TinyStories + PPO）
+#
+# 🛠️ 原 requirements 有三个问题：
+#   1. 缺 tyro：ppo.py 顶部 `import tyro`，没装它 ppo.py 直接 ImportError；
+#   2. 缺 DataLoader/生成所需的完整依赖说明（sympy/networkx/jinja2/filelock 是 torch 的运行时依赖）；
+#   3. 全量 == 锁死版本，在 Python 3.11+ / 新 CUDA 上装不上（pip 会一路回溯报错）。
+#      这里改成“下限锁定 + 上限保护”，方便在不同环境复现。
+numpy>=1.23.5,<2.0
+torch>=2.0.1
+sentencepiece>=0.1.99
+requests>=2.31.0
+tqdm>=4.64.1
+tyro>=0.5.10          # ppo.py 的配置/CLI 依赖（原文件遗漏）
+pytest>=7.4.0         # tests/ 下的冒烟测试

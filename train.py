@@ -105,7 +105,7 @@ from copy import deepcopy    # 深复制：PPO 里要复制整张模型
 from contextlib import nullcontext  # “什么也不做”的 with 占位符
 from datetime import datetime       # 获取当前日期时间
 from functools import partial       # 提前锁定部分参数，得到“半成品函数”
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, is_dataclass
 
 import torch                 # PyTorch 主库，负责张量+自动求导
 from torch.distributed import destroy_process_group, init_process_group
@@ -143,6 +143,8 @@ def TrainConfig():
     log_group.add_argument("--eval_interval", type=int, default=2000, help="验证间隔步数") 
     log_group.add_argument("--always_save_checkpoint", action="store_true", default=False, help="始终保存检查点")
     log_group.add_argument("--init_from", type=str, choices=["scratch", "resume"], default="scratch", help="初始化:从头训/接续") #resume
+    # 🛠️ 新增：显式指定续训 checkpoint（跨目录续训、加载别人给的 ckpt 时很有用）
+    log_group.add_argument("--ckpt_path", type=str, default="", help="续训 checkpoint 路径（留空则自动在 out_dir 中查找）")
 
     # ---------------------------
     # 参数分组：数据配置
@@ -154,6 +156,9 @@ def TrainConfig():
                           default="llama2", help="词表来源")
     data_group.add_argument("--vocab_size", type=int, default=32000, help="词表尺寸（需与来源一致）")
     data_group.add_argument("--tokenizer_path", type=str, default="", help="自定义分词器路径")
+    # 🛠️ 新增：数据加载并行度。原来硬编码 num_workers=0，读盘/反序列化与训练抢同一线程，
+    #    GPU 空转。CPU 核心多的话设 2~8（注意：worker 多会多吃内存，因为每个 worker 一份 bin 映射）。
+    data_group.add_argument("--num_workers", type=int, default=0, help="DataLoader 工作进程数（0=主线程读取）")
 
     # ---------------------------
     # 参数分组：模型结构
@@ -195,7 +200,9 @@ def TrainConfig():
     device_group = parser.add_argument_group("硬件配置")
     device_group.add_argument("--device", type=str, choices=["cpu", "cuda", "mps"], 
                             default="cuda", help="计算设备")
-    device_group.add_argument("--dtype", type=str, choices=["float16", "bfloat16"], 
+    # 🛠️ 原来 choices 只有 float16/bfloat16，但 _setup_ddp 里的精度映射表是有 float32 的：
+    #    CPU 训练/调试想指定 float32 会被 argparse 直接拒绝（invalid choice）。
+    device_group.add_argument("--dtype", type=str, choices=["float32", "float16", "bfloat16"], 
                             default="float16", help="数据类型")
     device_group.add_argument("--compile", action="store_true",default=False,  # 🛠️ 改为布尔标记
                             help="启用模型编译优化（默认禁用）") 
@@ -270,10 +277,14 @@ def get_lr(it: int, arg: TrainConfig) -> float:
 [数据加载器] → [批次数据X/Y] → [模型预测] → [计算loss] → [重复N次取平均]
            ↖_________________________↙
 '''
-@torch.no_grad() # ← 评估时不计算梯度，节省显存/速度快
 @torch.no_grad()  # 魔法开关：关闭自动求导功能，就像考试时不需要记笔记
-def estimate_loss(model, iter_batches, ctx, arg: TrainConfig):
-    """评估模型在训练集和验证集上的平均损失（相当于模拟考试）"""
+def estimate_loss(model, next_batch, ctx, arg: TrainConfig):
+    """
+    评估模型在训练集和验证集上的平均损失（相当于模拟考试）
+
+    🛠️ 参数由 iter_batches(生成器工厂) 改为 next_batch(split)->(X,Y)，
+       以便复用「长生命周期的数据迭代器」，避免每次评估都重建 DataLoader。
+    """
     # 结果字典：存放训练集和验证集的平均损失
     out = {}
     
@@ -282,15 +293,13 @@ def estimate_loss(model, iter_batches, ctx, arg: TrainConfig):
     
     # 同时在训练集和验证集上测试，好比同时做课堂练习和期末考试
     for split in ["train", "val"]:  
-        # 获取该数据集的数据加载器（就像拿到考卷）
-        batch_iter = iter_batches(split=split)  
         # 创建存放多次考试结果的成绩单（arg.eval_iters次测试取平均）
         losses = torch.zeros(arg.eval_iters)  
         
         # 进行多次小测试取平均（避免单次考试的偶然性）
         for k in range(arg.eval_iters):
             # 获取一个批次的题目和答案（X是题目，Y是标准答案）
-            X, Y = next(batch_iter)  
+            X, Y = next_batch(split)  
             # 使用混合精度计算（相当于用更高效的答题工具）
             with ctx:  # fp16 / bf16 
                 # 模型做题：获取预测结果和错误程度（logits是预测答案，loss是错误值）
@@ -305,6 +314,83 @@ def estimate_loss(model, iter_batches, ctx, arg: TrainConfig):
     model.train()  
     
     return out  # 返回两份成绩单：训练集和验证集的平均错误值
+
+
+# -----------------------------------------------------------------------------
+# 👉 2.5 工具函数：配置序列化 / 检查点定位 / 权重前缀清理
+# -----------------------------------------------------------------------------
+def config_to_dict(arg) -> dict:
+    """
+    把配置对象安全地转成 dict，用于写进 checkpoint。
+
+    🛠️ 原代码用的是 dataclasses.asdict(arg)，但 TrainConfig 只是一个
+    argparse.Namespace（返回 parser.parse_args()），并不是 dataclass：
+        >>> asdict(Namespace(a=1))
+        TypeError: asdict() should be called on dataclass instances
+    也就是说：第一次触发“保存 checkpoint”时程序必然崩溃，训练白跑。
+    这里统一用 vars()（Namespace）/ dataclasses.asdict()（dataclass）两种分支。
+    """
+    if is_dataclass(arg) and not isinstance(arg, type):
+        return asdict(arg)
+    if isinstance(arg, argparse.Namespace):
+        return vars(arg).copy()
+    return dict(vars(arg))
+
+
+def resolve_ckpt_path(out_dir: str, ppo: bool, ckpt_path: str = "") -> str:
+    """
+    定位续训用的 checkpoint 文件。
+
+    🛠️ 原代码在 init_from=resume 时只会去找 out_dir/ckpt.pt，但：
+      * PPO 阶段保存的文件名是 ppo_ckpt.pt（见 train() 里的 fname 逻辑）；
+      * README 里 PPO 阶段又把 out_dir 指到了另一个目录（outmini vs stories260K）。
+    结果就是“续训/PPO 微调”阶段直接 FileNotFoundError。
+    现在按 ckpt_path > ppo_ckpt.pt > ckpt.pt 的顺序查找，仍然找不到再报错。
+    """
+    if ckpt_path:
+        assert os.path.isfile(ckpt_path), f"指定的 checkpoint 不存在：{ckpt_path}"
+        return ckpt_path
+    candidates = ["ppo_ckpt.pt", "ckpt.pt"] if ppo else ["ckpt.pt", "ppo_ckpt.pt"]
+    for name in candidates:
+        path = os.path.join(out_dir, name)
+        if os.path.isfile(path):
+            return path
+    return os.path.join(out_dir, candidates[0])
+
+
+def load_model_state(model, state_dict: dict, master_process: bool = True):
+    """
+    加载权重，并处理 torch.compile 留下的 `_orig_mod.` 前缀。
+
+    🛠️ 这是最隐蔽的一个坑：README 里预训练用了 --compile，
+    torch.compile 会把参数名改成 `_orig_mod.xxx` 存进 ckpt，
+    而 resume 时模型没有 compile → strict=False 下所有 key 都“对不上”，
+    一句 warning 都不报就把权重全丢了：所谓的 PPO 微调其实是**随机初始化**在训练。
+    这里既兼容带前缀的 ckpt，也兼容不带前缀的 ckpt，并显式校验加载比例。
+    """
+    prefix = "_orig_mod."
+    has_prefixed = any(k.startswith(prefix) for k in state_dict)
+    has_plain = any(not k.startswith(prefix) for k in state_dict)
+    if has_prefixed and not has_plain:
+        state_dict = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
+
+    info = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = list(info.missing_keys), list(info.unexpected_keys)
+    if master_process:
+        print(f"✓ 权重装载完成：缺失 {len(missing)} 项，多余 {len(unexpected)} 项")
+        if missing:
+            print(f"  ⚠️ 缺失（未从 ckpt 恢复）：{missing[:5]}{' ...' if len(missing) > 5 else ''}")
+        if unexpected:
+            print(f"  ⚠️ 多余（ckpt 里有但模型没有）：{unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}")
+
+    # 只允许 freqs_* 这类非参数 buffer 缺失，否则说明权重根本没加载上
+    real_missing = [k for k in missing if "freqs" not in k and "cache" not in k]
+    if len(real_missing) > 0.5 * len(list(model.state_dict())):
+        raise RuntimeError(
+            f"⚠️ 超过一半的参数没有从 checkpoint 恢复（缺失 {len(real_missing)} 项），"
+            f"请检查 checkpoint 与模型结构是否一致，避免静默地从头训练。"
+        )
+    return info
 
 
 # -----------------------------------------------------------------------------
@@ -339,7 +425,9 @@ class TinyStoriesTrainer:
             self.ddp_local_rank = int(os.environ["LOCAL_RANK"]) # 本地厨房编号
             self.ddp_world_size = int(os.environ["WORLD_SIZE"]) # 总厨师数
             print("self.ddp_world_size",self.ddp_world_size)
-            exit()
+            # 🛠️ 原代码这里有一句 exit()：只要用 torchrun 多卡启动就会立刻退出进程，
+            #    DDP 等于完全不可用（且 exit() 只存在于交互解释器，脚本里应使用 sys.exit）。
+            #    已删除，让下面的设备绑定 / DDP 包装正常执行。
             
             # 指定当前厨师使用的灶台（GPU设备）
             arg.device = f"cuda:{self.ddp_local_rank}"
@@ -375,6 +463,10 @@ class TinyStoriesTrainer:
         # 类比：使用快速切菜刀（效率高但切口稍粗糙）
         torch.backends.cuda.matmul.allow_tf32 = True  # 矩阵乘法
         torch.backends.cudnn.allow_tf32  = True       # 卷积运算
+        # 🛠️ 新增：让 fp32 矩阵乘法也走 TF32（新式 API，效果同 allow_tf32，但覆盖更全；
+        #    对 CPU 无副作用），这与上面的两行一起才能完全打开 TF32 加速。
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
         
         # 记录设备类型（cuda或cpu）
         self.device_type = "cuda" if "cuda" in arg.device else "cpu"
@@ -400,7 +492,11 @@ class TinyStoriesTrainer:
 
     # --------------------- 数据 ---------------------
     # --------------------- 数据加载器构建（像快递分拣流水线） ---------------------
-    def _build_dloader(self):
+    def _build_dataloader(self):
+        # 🛠️ 原方法名是 _build_dloader，但 __init__ 里调用的是 self._build_dataloader()
+        #    → 一启动就 AttributeError: 'TinyStoriesTrainer' object has no attribute
+        #    '_build_dataloader'，train.py 根本无法运行（除 --help 外任何参数都会崩）。
+        #    这里改回正确的名字，并保留 _build_dloader 作为向后兼容别名。
         # 获取配置参数（相当于快递公司的操作手册）
         arg = self.arg  # 从类实例中取出预设参数
 
@@ -414,8 +510,25 @@ class TinyStoriesTrainer:
             vocab_size=arg.vocab_size,      # 快递类型总数（如5000种）
             vocab_source=arg.vocab_source,  # 快递来源（如"自定义"或"公开数据集"）
             device=arg.device,              # 运送工具（如cuda:0是1号卡车）
-            num_workers=0,                  # 分拣员数量（0表示不用多线程）
+            # 🛠️ num_workers 原来硬编码为 0：读盘 + 反序列化完全跑在主线程上，
+            #    GPU 会周期性空转等数据。改为可通过 --num_workers 配置。
+            num_workers=arg.num_workers,
         )
+        # 🛠️ 关键性能修复：Task.iter_batches() 每调用一次都会新建一个 DataLoader，
+        #    num_workers>0 时还会重新 fork 出 N 个 worker 进程（冷启动 + 重新 mmap 所有分片）。
+        #    原代码在「每个梯度累积 micro-step」都调用一次 next(iter_batches(...))，
+        #    等于每步都重启一遍数据流水线，GPU 期间只能干等。
+        #    这里为 train / val 各缓存一个长生命周期的迭代器，只建一次。
+        self._batch_iters = {}
+
+    def _next_batch(self, split="train"):
+        """取一个批次；首次调用时才真正创建 DataLoader（之后复用同一个迭代器）。"""
+        if split not in self._batch_iters:
+            self._batch_iters[split] = iter(self.iter_batches(split=split))
+        return next(self._batch_iters[split])
+
+    # 向后兼容：老代码/老脚本可能还在调用 _build_dloader
+    _build_dloader = _build_dataloader
 
 
     # --------------------- 模型 ---------------------
@@ -454,15 +567,26 @@ class TinyStoriesTrainer:
             self.model = (Transformer(gptconf) if not arg.ppo 
                           else TransformerWithValueHead(gptconf))
         else:  # 方案B：续建工程（加载检查点）
-            ckpt_path = os.path.join(arg.out_dir, "ckpt.pt")  # 找到之前的工程存档
+            # 🛠️ 原来写死 os.path.join(arg.out_dir, "ckpt.pt")：PPO 阶段存的是 ppo_ckpt.pt，
+            #    且 README 里 PPO 阶段的 out_dir 与预训练阶段并不相同，续训必然找不到文件。
+            ckpt_path = resolve_ckpt_path(arg.out_dir, arg.ppo, getattr(arg, "ckpt_path", ""))
             if self.master_process:
                 print(f"⏯ 正在读取工程存档：{ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location=arg.device)  # 加载存档
+            self.ckpt_path = ckpt_path  # 供 _build_optimizer 复用同一份存档
 
             # [结构安全检测] 确保新旧设计参数一致
             for k in ["dim", "n_layers", "n_heads", "n_kv_heads",
                       "vocab_size", "multiple_of", "max_seq_len"]:
-                model_args[k] = checkpoint["model_args"][k]  # 强制对齐关键参数
+                # 🛠️ 兼容两种 checkpoint 格式：
+                #    * "model_args"：本仓库 train.py 自己存的（Namespace/dict）
+                #    * "config"：llama2.c / 早期脚本存的（data/ckpt.pt 里两种键都有）
+                saved = checkpoint.get("model_args", None) or checkpoint.get("config", None)
+                assert saved is not None, "checkpoint 里既没有 model_args 也没有 config，无法恢复结构"
+                if isinstance(saved, argparse.Namespace):
+                    saved = vars(saved)
+                if k in saved:
+                    model_args[k] = saved[k]  # 强制对齐关键参数
 
             gptconf = ModelArgs(**model_args)  # 重新生成施工图纸
             # 重建建筑框架（与存档结构一致）
@@ -470,14 +594,13 @@ class TinyStoriesTrainer:
                           else TransformerWithValueHead(gptconf))
 
             # [材料装载] 加载之前的建筑材料（模型参数）
-            badkeys = self.model.load_state_dict(checkpoint["model"], strict=False)
-            if self.master_process:
-                # 报告材料差异：正常情况只有 freqs_cis 不匹配
-                print(f"✓ 材料装载完成，差异报告：{badkeys}")  
+            # 🛠️ 用 load_model_state 处理 torch.compile 的 `_orig_mod.` 前缀，
+            #    否则 strict=False 会静默丢掉全部权重（详见函数注释）。
+            load_model_state(self.model, checkpoint["model"], self.master_process)
 
             # [恢复工程进度]
-            self.iter_num = checkpoint["iter_num"]          # 当前施工阶段编号
-            self.best_val_loss = checkpoint["best_val_loss"] # 历史最佳质量记录
+            self.iter_num = checkpoint.get("iter_num", 0)          # 当前施工阶段编号
+            self.best_val_loss = checkpoint.get("best_val_loss", 1e9) # 历史最佳质量记录
 
         # [设备运输] 将模型部署到指定设备（GPU/CPU）
         self.model.to(arg.device)  # 如运送至'cuda:0'号施工场地
@@ -578,19 +701,25 @@ class TinyStoriesTrainer:
         # 注：该方法内部自动选择AdamW优化器，类似选择专业健身教练
 
         # 【续训模式】加载历史训练记录（继续之前的健身计划）
-        if arg.init_from == "resume" and os.path.exists(os.path.join(arg.out_dir, "ckpt.pt")):
+        # 🛠️ 原来固定读 out_dir/ckpt.pt，与 _build_model 的查找逻辑不一致；
+        #    这里复用同一份解析结果，找不到就跳过（不静默加载错误文件）。
+        ckpt_path = getattr(self, "ckpt_path", "") or resolve_ckpt_path(
+            arg.out_dir, arg.ppo, getattr(arg, "ckpt_path", "")
+        )
+        if arg.init_from == "resume" and os.path.exists(ckpt_path):
             try:
                 # 打开之前的训练日志（加载检查点文件）
                 checkpoint = torch.load(
-                    os.path.join(arg.out_dir, "ckpt.pt"),  # 存档文件路径
+                    ckpt_path,  # 存档文件路径
                     map_location="cpu"  # 先加载到内存（避免设备不匹配）
                 )
                 # 教练团读取历史训练数据（加载优化器状态）
-                self.optimizer.load_state_dict(checkpoint["optimizer"])
+                if "optimizer" in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint["optimizer"])
 
                 # 主教练播报进度（仅主进程打印）
                 if self.master_process:
-                    print("⤵ 成功载入历史训练记录（动量/学习率等状态）")
+                    print(f"⤵ 成功载入历史训练记录（动量/学习率等状态）：{ckpt_path}")
             except Exception as e:
                 # 当历史记录损坏时的应急方案（如版本不兼容）
                 if self.master_process:
@@ -613,8 +742,10 @@ class TinyStoriesTrainer:
     def train(self):
         # 【工厂总控】获取训练配置参数（相当于生产车间的操作手册）
         arg = self.arg
-        iter_batches = self.iter_batches  # 原材料供应管道（数据批次生成器）
-        X, Y = next(iter_batches(split="train"))  # 首次获取原料（训练数据的输入X和标签Y）
+        # 🛠️ 用 _next_batch 复用同一个长生命周期迭代器（原代码每次 next(iter_batches(...))
+        #    都会新建 DataLoader / 重启 worker 进程，见 _build_dataloader 里的说明）
+        next_batch = self._next_batch  # 原材料供应管道（数据批次生成器）
+        X, Y = next_batch("train")  # 首次获取原料（训练数据的输入X和标签Y）
 
         # 【产能计算】计算每次迭代处理的总数据量（相当于工厂的日产量）
         '''
@@ -644,7 +775,7 @@ class TinyStoriesTrainer:
 
             # --- 质量检测与存档（定期产品质检）---
             if iter_num % arg.eval_interval == 0 and self.master_process:  # 每N次迭代检测
-                losses = estimate_loss(self.model, iter_batches, self.ctx, arg)  # 质量评估
+                losses = estimate_loss(self.model, next_batch, self.ctx, arg)  # 质量评估
                 print(f"step {iter_num}: 训练损失 {losses['train']:.4f}, 验证损失 {losses['val']:.4f}")
 
                 # 当检测到更优模型时存档（破纪录存档）
@@ -654,7 +785,10 @@ class TinyStoriesTrainer:
                         ckpt = {  # 存档内容
                             "model": self.raw_model.state_dict(),      # 生产线当前参数
                             "optimizer": self.optimizer.state_dict(),  # 优化器状态（动量等）
-                            "model_args": asdict(arg),                 # 生产配置参数
+                            # 🛠️ 原来是 asdict(arg)：arg 是 argparse.Namespace 不是 dataclass，
+                            #    这行会抛 TypeError（asdict() should be called on dataclass
+                            #    instances），也就是第一次评估保存 checkpoint 时必崩。
+                            "model_args": config_to_dict(arg),         # 生产配置参数
                             "iter_num": iter_num,                      # 当前批次编号
                             "best_val_loss": best_val_loss,            # 最佳质检成绩
                         }
@@ -668,17 +802,23 @@ class TinyStoriesTrainer:
             # === 核心生产流程（前向传播+反向传播）===
             # 【分步加工】梯度累积（类似分期完成大额支付）
             for micro in range(arg.gradient_accumulation_steps):
-                if self.ddp:  # 分布式训练时同步控制
-                    # 仅在最后一次微批次时同步梯度（类似分厂最后统一汇总）
-                    self.model.require_backward_grad_sync = (micro == arg.gradient_accumulation_steps - 1)
+                # 🛠️ 原来直接改 DDP 内部属性 self.model.require_backward_grad_sync：
+                #    这是私有实现细节，在 torch.compile / 新版 torch 下随时可能失效或静默
+                #    不生效（多卡时梯度同步次数错误，等价于 batch 变大/变小）。
+                #    官方推荐用 no_sync() 上下文，语义一致且稳定。
+                sync_ctx = (
+                    nullcontext() if (not self.ddp) or micro == arg.gradient_accumulation_steps - 1
+                    else self.model.no_sync()
+                )
+                with sync_ctx:
 
-                # 【原料加工】前向计算
-                with self.ctx:  # 自动混合精度上下文（精密加工车间）
-                    _, loss = self.model(X, Y)[-2:]    # 获取预测结果和损失值
-                    loss = loss / arg.gradient_accumulation_steps  # 分摊损失（分期付款）
+                    # 【原料加工】前向计算
+                    with self.ctx:  # 自动混合精度上下文（精密加工车间）
+                        _, loss = self.model(X, Y)[-2:]    # 获取预测结果和损失值
+                        loss = loss / arg.gradient_accumulation_steps  # 分摊损失（分期付款）
 
-                X, Y = next(iter_batches(split="train"))  # 预取下一批原料（流水线持续供料）
-                self.scaler.scale(loss).backward()       # 反向传播计算梯度（质量分析报告）
+                    X, Y = next_batch("train")  # 预取下一批原料（流水线持续供料）
+                    self.scaler.scale(loss).backward()       # 反向传播计算梯度（质量分析报告）
 
             # 【工艺优化】梯度处理与参数更新
             if arg.grad_clip != 0.0:  # 梯度裁剪（防止过激调整）

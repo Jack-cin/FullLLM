@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 训练产物（模型/日志/导出文件，体积大，不要进仓库）
+out*/
+*.bin
+*.gz
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
